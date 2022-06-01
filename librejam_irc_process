@@ -1,0 +1,345 @@
+#!/bin/sh
+#―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+# Name:	librejam_irc_process
+# Desc:	Part of a game-jam chatbot. Processes lines of `ii` output from stdin
+#	as chat commands. Outputs text to be sent to the chatroom.
+#	Should probably not be run manually, but instead by librejam_irc.
+# Reqs: librejam_gemini
+# Date:	2022-03-30
+#―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+
+line_date() {
+	sed 's% .*%%'
+}
+
+line_sender() {
+	line_sanitize \
+	| awk '{print $3}' \
+	| tr -d '<>'
+}
+
+line_message() {
+	line_sanitize \
+	| after_column 3
+}
+
+line_command() {
+	line_message \
+	| awk '{print $1}' \
+	| grep '^!'
+}
+
+line_args() {
+	line_message \
+	| after_column 1
+}
+
+line_sanitize() {
+	tr -d '$`{}^%\\'
+}
+
+after_column() {
+	local column_no="$1"
+	cut -sd ' ' -f "$((column_no+1))"-
+}
+
+ensure_file() {
+	local path="$1"
+	touch "$path"
+	if test ! -e "$path"; then
+		>&2 echo "${path} cannot be created; do you have write permission for this directory?"
+		return 3
+	elif test ! -w "$path" -o ! -r "$path"; then
+		>&2 echo "${path} is either not readable or not writible-- please check your permissions."
+		return 3
+	fi
+}
+
+ensure_directory() {
+	local path="$1"
+	mkdir -p "$path"
+	if test ! -d "$path"; then
+		>&2 echo "$path isn't an accessible directory."
+		return 2
+	fi
+}
+
+remove_line() {
+	local path="$1"
+	local line="$2"
+	local tmp="$(mktemp)"
+
+	grep -v "$line" "$path" \
+	> "$tmp"
+
+	cat "$tmp" \
+	> "$path"
+
+	echo "$line" \
+	>> "$path.old"
+}
+
+sanitize() {
+	sed 's% %-%g' \
+	| tr 'A-Z' 'a-z' \
+	| sed 's% $%%'
+}
+
+init_gemini() {
+	local sender="$1"; local url="$2"; local branch="$3"; local name="$4"
+	local outname="$(echo "$name" | sanitize)"
+
+	librejam_gemini "$sender" "$url" "$branch" "$name" "$SUBMISSIONS_DIR" \
+		"$ratings_path" \
+	> "$SUBMISSIONS_DIR/${outname}/${outname}.gmi"
+}
+
+update_gemini() {
+	local sender="$1"; local url="$2"; local branch="$3"; local name="$4"
+	local ratings_path="$5"
+	local outname="$(echo "$name" | sanitize)"
+	ensure_directory "$SUBMISSIONS_DIR/${outname}/"
+	ensure_directory "$(dirname "$ratings_path")"
+
+	librejam_gemini "$sender" "$url" "$branch" "$name" "$SUBMISSIONS_DIR" \
+		"$ratings_path" \
+	> "$SUBMISSIONS_DIR/${outname}/${outname}.gmi"
+	case "$?" in
+		0) return 0 ;;
+		1) echo "$sender: I had trouble cloning your git repo― did you give me the right URL?" ;;
+		2) echo "$sender: Couldn't switch to the $branch branch― does $branch even exist?" ;;
+		3) echo "$sender: Couldn't download the archive― did you give the right URL?" ;;
+	esac
+	return 2
+}
+
+
+HELP_SUBMIT="!submit <url> [-b branch] <name>
+.   Submit a Librejam entry, either with a Git repository or archive over FTP/HTTP/etc.
+.   If submitting a Git repository, you must specify the branch with the -b
+.   argument. You can update your submission until the jam ends by re-running
+.   this command."
+submit_cmd() {
+	local args="$1"; local sender="$2"
+	local entries="$SUBMISSIONS_DIR/entries.txt"
+	local url="$(echo "$args" | awk '{print $1}')"
+	local branch="$(echo "$args" | awk '{print $3}')"
+	local name="$(echo "$args" | after_column 3)"
+
+	if test ! "$(echo "$args" | awk '{print $2}')" = "-b"; then
+		branch=":curl"
+		name="$(echo "$args" | after_column 1)"
+	fi
+
+	ensure_file "$entries"
+	ensure_file "$entries.old"
+	if test "$SUBMITTING_ENDS" -le "$(date +%s)"; then
+		echo "$sender: Sorry, but the time for submissions is over!"
+		return
+	fi
+
+	# Just in case they've already submitted
+	local prev_entry="$(grep "^$sender" "$entries")"
+
+	if test -z "$prev_entry" -a -z "$name" -o -z "$url"; then
+		echo "$sender: Please provide all arguments to submit!"
+		return
+	fi
+
+	# If they've already submitted, replace empty args with implied values
+	if test -z "$name" -a -n "$prev_entry"; then
+		name="$(echo "$prev_entry" | after_column 3)"
+	fi
+	if test -z "$branch" -a -n "$prev_entry"; then
+		branch="$(echo "$prev_entry" | awk '{print $3}')"
+	fi
+	if test -z "$url" -a -n "$prev_entry"; then
+		url="$(echo "$prev_entry" | awk '{print $2}')"
+	fi
+
+	submit_game "$sender" "$prev_entry" "$url" "$branch" "$name"
+}
+
+submit_game() {
+	local sender="$1"; local prev_entry="$2"
+	local url="$3"; local branch="$4"; local name="$5"
+	local entries="$SUBMISSIONS_DIR/entries.txt"
+	local outname="$(echo "$name" | sanitize)"
+
+	update_gemini "$sender" "$url" "$branch" "$name"
+
+	if test "$?" -eq 0; then
+		# Remove previous entry, if necessary
+		if test -n "$prev_entry"; then
+			remove_line "$entries" "$prev_entry"
+		fi
+
+		echo "$sender $url $branch $name" \
+		>> "$entries"
+		if test "$branch" = ":curl"; then
+			echo "$sender: $name has been submitted from archive!"
+		else	
+			echo "$sender: $name has been submitted from git!"
+		fi
+	fi
+}
+
+
+HELP_RATE="!rate <index> <1-10> [comment]
+.   Submit your rating on a given game, with an optional comment. If you  rate
+.   a single game multiple times, the latest rating will be used."
+rate_cmd() {
+	local args="$1"; local sender="$2"
+	local id="$(echo "$args" | awk '{print $1}')"
+	local rating="$(echo "$args" | awk '{print $2}')"
+	local comment="$(echo "$args" | after_column 2)"
+	local entries="$SUBMISSIONS_DIR/entries.txt"
+
+	local now="$(date +%s)"
+	if test "$now" -le "$SUBMITTING_ENDS" -o "$now" -gt "$RATING_ENDS"; then
+		echo "$sender: Sorry, it's not time to rate!"
+		return
+	fi
+	if test "$rating" -lt 1 -o "$rating" -gt 10; then
+		echo "$sender: That's an invalid rating, sorry!"
+		return
+	fi
+	local entry_count="$(wc -l "$entries" | awk '{print $1}')"
+	if test "$id" -lt 1 -o "$id" -gt "$entry_count"; then
+		echo "$sender: That's… that's not an ID.  Try below $entry_count."
+		return
+	fi
+
+	local entry="$(awk 'NR=='"$id" "$entries")"
+	local outname="$(echo "$entry" | after_column 3 | sanitize)"
+	local ratings="$SUBMISSIONS_DIR/${outname}/ratings.txt"
+	ensure_directory "$(dirname "$ratings")"
+	ensure_file "$ratings"
+
+	if test "$sender" = "$(echo "$entry" | awk '{print $1}')"; then
+		echo "$sender: … You can't rate your own game! xD"
+		return
+	fi
+
+	local prev_rating="$(grep "^$sender" "$ratings" | head -1)"
+	if test -n "$prev_rating"; then
+		remove_line "$ratings" "$prev_rating"
+	fi
+	echo "$sender $rating $comment" \
+	>> "$ratings"
+
+	echo "$sender: Rating accepted!"
+
+	update_gemini "$(echo "$entry" | awk '{print $1}')" \
+		"$(echo "$entry" | awk '{print $2}')" \
+		"$(echo "$entry" | awk '{print $3}')" \
+		"$(echo "$entry" | after_column 3)" \
+		"$ratings"
+}
+
+HELP_LIST="!list
+.   List all games submitted for the jam."
+list_cmd() {
+	local entries="$SUBMISSIONS_DIR/entries.txt"
+
+	local index="1"
+	while read entry; do
+		if test -n "$entry"; then
+			local name="$(echo "$entry" | after_column 3)"
+			echo "$entry" \
+			| awk '{ printf("[%s] %s | By %s | %s\n",
+				'"$index"', "'"$name"'", $1, $2) }'
+			index="$((index + 1))"
+		fi
+	done < "$entries"
+}
+
+
+HELP_ABOUT="!about
+.   … you could just try the command. It won't bite."
+about_cmd() {
+	local sender="$2"
+
+	echo "$sender: I'm a bot made for Librejam (gemini://leagueh.xyz/en/librejam)."
+	echo "My sauce is at https://github.com/jadedctrl/librejam-omnom/"
+	echo "Current submissions are at gemini://xwx.moe/librejam/"
+	echo "Submissions end at: $(date -ud @"$SUBMITTING_ENDS")"
+	echo "Rating ends at: $(date -ud @"$RATING_ENDS")"
+}
+
+
+HELP_HELP="!help <command>
+.   … do I really have to explain this one? <o<\""
+help_cmd() {
+	local args="$1"
+	local sender="$2"
+
+	case "$args" in
+		*submit*)
+			echo "$sender: $HELP_SUBMIT";;
+		*rate*)
+			echo "$sender: $HELP_RATE";;
+		*list*)
+			echo "$sender: $HELP_LIST";;
+		*about*)
+			echo "$sender: $HELP_ABOUT";;
+		*help*)
+			echo "$sender: $HELP_HELP";;
+		*)
+			echo "$sender: $HELP_HELP" | head -1
+			echo "$HELP_ABOUT" | head -1
+			echo "$HELP_RATE" | head -1
+			echo "$HELP_SUBMIT" | head -1
+			echo "$HELP_LIST" | head -1 ;;
+	esac
+}
+
+
+process_line() {
+	local line="$1"
+	local sender="$(echo "$line" | line_sender)"
+	local line_args="$(echo "$line" | line_args)"
+	local command="$(echo "$line" | line_command)"
+	if test "$?" -ne 0; then
+		return 1
+	fi
+
+	case "$command" in
+		"!submit")
+			submit_cmd "$line_args" "$sender" ;;
+		"!rate")
+			rate_cmd "$line_args" "$sender" ;;
+		"!list")
+			list_cmd "$line_args" "$sender" ;;
+		"!uwu")
+			echo "$sender: ur sweet <3" ;;
+		"!about")
+			about_cmd "$line_args" "$sender" ;;
+		"!help")
+			help_cmd "$line_args" "$sender" ;;
+	esac
+}
+
+
+NICK="$1"
+SUBMISSIONS_DIR="$2"
+SUBMITTING_ENDS="$(date -ud "$3" +%s)"
+RATING_ENDS="$(date -ud "$4" +%s)"
+if test -z "$SUBMISSIONS_DIR" -o -z "$SUBMITTING_ENDS" -o -z "$RATING_ENDS"
+then
+	>&2 echo "Usage: $(basename "$0") nick entry_dir submit_deadline rate_deadline"
+	exit 1
+fi
+ensure_directory "$SUBMISSIONS_DIR"
+
+while read line; do
+	if echo "$line" | grep "^....-..-.. ..:.. Closing link" >/dev/null; then
+		>&2 echo "ii has disconnected!"
+		exit 2;
+	fi
+
+	echo "$line" | grep "<$NICK>" > /dev/null
+	if test "$?" -ne 0; then
+		process_line "$line"
+	fi
+done

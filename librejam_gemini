@@ -1,0 +1,95 @@
+#!/bin/sh
+#―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+# Name:	librejam_gemini
+# Desc:	Creates a gemini page for a game-jam entry.
+# Reqs: librejam_gemini
+# Date:	2022-03-30
+#―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+
+sanitize() {
+	sed 's% %-%g' \
+	| tr 'A-Z' 'a-z' \
+	| sed 's% $%%'
+}
+
+get_release_git() {
+	pushd "$SUBMISSIONS_ROOT/$OUTNAME/"
+	git clone "$URL" "release"
+	if test "$?" -ne 0; then
+		popd
+		exit 1
+	fi
+
+	pushd "release/"
+	git checkout "$BRANCH"
+	if test "$?" -ne 0; then
+		popd
+		rm -rf release/
+		popd
+		exit 2
+	fi
+
+	popd
+	tar -czvf release.tar.gz release/
+	rm -rf release/
+	popd
+}
+
+
+get_release_curl() {
+	local suffix="$(echo "$URL" | sed 's%.*\.%%')"
+	if echo "$suffix" | grep "/"; then
+		suffix="raw"
+	fi
+
+	local out_path="$SUBMISSIONS_ROOT/$OUTNAME/release.$suffix"
+
+	curl -o "$out_path" "$URL"
+	if test "$?" -ne 0; then
+		exit 3
+	fi
+
+	OUTLEAF="$(basename "$out_path")"
+}
+
+average_rating() {
+	SUM="$(awk '{print $2}' "$RATINGS_FILE" | tr '\n' '+' | sed 's%+$%%')"
+	COUNT="$(wc -l "$RATINGS_FILE" | awk '{print $1}')"
+	echo "($SUM) / $COUNT" \
+	| bc
+}
+
+
+SENDER="$1"
+URL="$2"
+BRANCH="$3"
+NAME="$4"
+SUBMISSIONS_ROOT="$5"
+RATINGS_FILE="$6"
+
+OUTNAME="$(echo "$NAME" | sanitize)"
+OUTLEAF="release.tar.gz"
+
+if test -z "$RATINGS_FILE" -a "$BRANCH" = ":curl"; then
+	get_release_curl > /dev/null
+elif test -z "$RATINGS_FILE" -a -n "$BRANCH"; then
+	get_release_git > /dev/null
+fi
+
+echo "# $NAME - By $SENDER"
+echo "=> $OUTLEAF Submitted version"
+echo "=> $URL Upstream source"
+
+if test -n "$RATINGS_FILE" -a -e "$RATINGS_FILE"; then
+	echo ""
+	echo "## Ratings"
+	echo "* Average score: $(average_rating)"
+
+	awk	'{ printf("* %s: [%s] ", $1, $2);
+		for(i = 1; i <= NF; i++)
+			if (i > 2)
+				printf($i" ");
+		print "" }' \
+		"$RATINGS_FILE" \
+	| sed 's% $%%'
+fi

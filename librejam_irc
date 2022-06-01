@@ -1,0 +1,51 @@
+#!/bin/sh
+#―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+# Name:	librejam_irc
+# Desc:	A game-jam chatbot, using ii to connect to IRC. You need to edit the
+#       hard-coded variables at the start of this script.
+# Reqs: librejam_irc_process, ii-ssl
+# Date:	2022-05-31
+#―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+
+IRC_DIR="irc"
+SERVER="leagueh.xyz"
+ROOM="#librejam"
+NICK="omnom"
+NAME="Mx. Omnom"
+PASS=""
+SUBMISSIONS_DIR="/GEMINI/DOMAIN/librejam/2022-06/"
+SUBMITTING_ENDS="2022-06-15 01:00"
+RATING_ENDS="2022-06-21 23:59"
+
+connect() {
+	mkdir -p "$IRC_DIR"
+
+	pkill ii
+	ii -i "$IRC_DIR" -s "$SERVER" -e ssl -n "$NICK" -k "$PASS" -f "$NAME" &
+	sleep 5
+
+	if test ! -d "$IRC_DIR/$SERVER"; then
+		>&2 echo "Failed to connect to $SERVER! Might want to try 'ii' manually."
+		pkill ii
+		exit 2;
+	fi
+
+	echo "/j $ROOM" \
+	> "$IRC_DIR/$SERVER/in"
+	if test ! -e "$IRC_DIR/$SERVER/$ROOM/in"; then
+		>&2 echo "Failed to join $ROOM! Maybe check $IRC_DIR manually?"
+		exit 3;
+	fi
+}
+
+
+while true; do
+	connect
+
+	tail --lines=0 --follow "$IRC_DIR/$SERVER/$ROOM/out" "$IRC_DIR/$SERVER/out" \
+	| librejam_irc_process "$NICK" "$SUBMISSIONS_DIR" "$SUBMITTING_ENDS" "$RATING_ENDS" \
+	> "$IRC_DIR/$SERVER/$ROOM/in"
+	
+	# If ii's disconnected, let's take a pause before restarting.
+	sleep 5;
+done
